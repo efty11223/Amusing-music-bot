@@ -70,6 +70,12 @@ function createYoutubeAudioStream(url) {
             ffmpegError += chunk.toString();
         });
 
+        ffmpegProcess.stdin.on('error', (err) => {
+            if (err.code !== 'EPIPE') {
+                console.error(`ffmpeg input stream error: ${err.message}`);
+            }
+        });
+
         ffmpegProcess.on('error', (err) => reject(new Error(`Failed to start ffmpeg: ${err.message}`)));
 
         ytDlp.stdout.pipe(ffmpegProcess.stdin);
@@ -81,6 +87,9 @@ function createYoutubeAudioStream(url) {
         });
 
         ffmpegProcess.on('close', (code) => {
+            if (ytDlp.exitCode === null && !ytDlp.killed) {
+                ytDlp.kill();
+            }
             if (code !== 0 && !ffmpegError.includes('Output file')) {
                 reject(new Error(`ffmpeg failed while converting YouTube audio: ${ffmpegError || 'unknown ffmpeg error'}`));
             }
