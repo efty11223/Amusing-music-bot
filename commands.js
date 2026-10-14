@@ -136,10 +136,10 @@ async function handleCommand(message, queues, play) {
 
     playerObj.queue.push(queueItem);
 
-    if (playerObj.player.state.status === AudioPlayerStatus.Playing) {
-      message.channel.send(`➕ Added to queue: **${itemTitle}**`);
-    } else {
+    if (playerObj.player.state.status === AudioPlayerStatus.Idle) {
       playNext(message.guild.id, message, queues);
+    } else {
+      message.channel.send(`➕ Added to queue: **${itemTitle}**`);
     }
 
     return;
@@ -187,7 +187,7 @@ async function handleCommand(message, queues, play) {
     return message.reply("▶ Music resumed.");
   }
 
-  if (command === "skip") {
+  if (command === "skip" || command === "next") {
     const playerObj = queues.get(message.guild.id);
     if (!playerObj || !playerObj.player || playerObj.queue.length === 0) {
       return message.reply("❌ There is nothing to skip.");
