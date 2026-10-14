@@ -36,6 +36,25 @@ async function handleCommand(message, queues, play) {
   const source = args[0];
   const query = args.join(" ");
 
+  if (command === "help") {
+    return message.reply({
+      embeds: [{
+        color: 0xeea990,
+        title: "Music Bot Commands",
+        description: [
+          `\`${prefix}play <song, URL, or file>\` - Play or queue music`,
+          `\`${prefix}queue\` - Show the current queue`,
+          `\`${prefix}pause\` - Pause playback`,
+          `\`${prefix}resume\` - Resume playback`,
+          `\`${prefix}skip\` / \`${prefix}next\` - Skip the current track`,
+          `\`${prefix}stop\` - Stop playback and leave voice`,
+          `\`${prefix}leave\` - Leave voice`,
+          `\`${prefix}help\` - Show this command list`,
+        ].join("\n"),
+      }],
+    });
+  }
+
   if (command === "play") {
     if (!query) return message.reply("❌ Provide a filename, URL, or search query.");
     if (!message.member.voice.channel) return message.reply("❌ Join a voice channel first!");
