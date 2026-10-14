@@ -1,9 +1,44 @@
-const { createAudioResource, AudioPlayerStatus } = require("@discordjs/voice");
+const { createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require("@discordjs/voice");
 const { spawn, spawnSync } = require("node:child_process");
 const ffmpeg = require("ffmpeg-static");
 const play = require("play-dl");
 const path = require("path");
 const fs = require("fs");
+
+function getIdleTimeoutMs() {
+    const configuredTimeout = Number.parseInt(process.env.MUSIC_IDLE_TIMEOUT_MS, 10);
+    return Number.isFinite(configuredTimeout) && configuredTimeout > 0
+        ? configuredTimeout
+        : 5 * 60 * 1000;
+}
+
+function clearIdleDisconnect(playerObj) {
+    if (playerObj && playerObj.idleTimer) {
+        clearTimeout(playerObj.idleTimer);
+        playerObj.idleTimer = null;
+    }
+}
+
+function scheduleIdleDisconnect(guildId, message, queues, playerObj) {
+    clearIdleDisconnect(playerObj);
+    const timeoutMs = getIdleTimeoutMs();
+
+    playerObj.idleTimer = setTimeout(() => {
+        if (queues.get(guildId) !== playerObj) return;
+
+        playerObj.idleTimer = null;
+        if (playerObj.queue.length > 0 || playerObj.player.state.status !== AudioPlayerStatus.Idle) return;
+
+        queues.delete(guildId);
+        if (playerObj.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            playerObj.connection.destroy();
+        }
+
+        if (message && message.channel) {
+            message.channel.send(`👋 Disconnected after ${Math.ceil(timeoutMs / 60000)} minutes of inactivity.`);
+        }
+    }, timeoutMs);
+}
 
 function resolveYtDlpPath() {
     if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
@@ -104,18 +139,19 @@ async function playNext(guildId, message, queues) {
     if (!playerObj) return;
 
     if (playerObj.queue.length === 0) {
-        console.log(`[${guildId}] Queue finished. Disconnecting.`);
-        if (playerObj.connection && !playerObj.connection.destroyed) {
+        console.log(`[${guildId}] Queue finished. Scheduling idle disconnect.`);
+        scheduleIdleDisconnect(guildId, message, queues, playerObj);
+        if (playerObj.player.state.status !== AudioPlayerStatus.Idle) {
             playerObj.player.stop();
-            playerObj.connection.destroy();
         }
-        queues.delete(guildId);
         if (message && message.channel) {
-            message.channel.send("✅ Queue finished! Disconnected.");
+            const timeoutMinutes = Math.ceil(getIdleTimeoutMs() / 60000);
+            message.channel.send(`✅ Queue finished. I'll disconnect after ${timeoutMinutes} minutes of inactivity.`);
         }
         return;
     }
 
+    clearIdleDisconnect(playerObj);
     const nextItem = playerObj.queue[0];
     let resource;
 
@@ -166,6 +202,7 @@ async function playNext(guildId, message, queues) {
 
 module.exports = {
     createYoutubeAudioStream,
+    clearIdleDisconnect,
     playNext,
     resolveYtDlpPath,
 };

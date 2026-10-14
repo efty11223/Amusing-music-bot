@@ -1,7 +1,7 @@
 const path = require("path");
 const fs = require("fs");
-const { joinVoiceChannel, createAudioPlayer, AudioPlayerStatus } = require("@discordjs/voice");
-const { playNext } = require("./music");
+const { joinVoiceChannel, createAudioPlayer, AudioPlayerStatus, VoiceConnectionStatus } = require("@discordjs/voice");
+const { clearIdleDisconnect, playNext } = require("./music");
 
 function leaveGuildVoice(message, queues) {
   const guildId = message.guild.id;
@@ -11,15 +11,17 @@ function leaveGuildVoice(message, queues) {
     return message.reply("❌ I'm not in a voice channel right now.");
   }
 
+  clearIdleDisconnect(playerObj);
+  queues.delete(guildId);
+
   if (playerObj.player) {
     playerObj.player.stop();
   }
 
-  if (playerObj.connection && !playerObj.connection.destroyed) {
+  if (playerObj.connection && playerObj.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     playerObj.connection.destroy();
   }
 
-  queues.delete(guildId);
   return message.reply("👋 Left the voice channel.");
 }
 
@@ -110,7 +112,7 @@ async function handleCommand(message, queues, play) {
       });
 
       player.on(AudioPlayerStatus.Idle, async () => {
-        if (!playerObj) return;
+        if (!playerObj || queues.get(message.guild.id) !== playerObj) return;
 
         if (playerObj.isTransitioning) return;
         playerObj.isTransitioning = true;
@@ -118,6 +120,8 @@ async function handleCommand(message, queues, play) {
         try {
           if (playerObj.queue.length === 0) {
             console.log(`[${message.guild.id}] Idle event fired with an empty queue.`);
+            if (playerObj.idleTimer) return;
+            await playNext(message.guild.id, message, queues);
             return;
           }
 
@@ -204,15 +208,17 @@ async function handleCommand(message, queues, play) {
       return message.reply("❌ Nothing is playing right now.");
     }
 
+    clearIdleDisconnect(playerObj);
+    queues.delete(message.guild.id);
+
     if (playerObj.player) {
       playerObj.player.stop();
     }
 
-    if (playerObj.connection && !playerObj.connection.destroyed) {
+    if (playerObj.connection && playerObj.connection.state.status !== VoiceConnectionStatus.Destroyed) {
       playerObj.connection.destroy();
     }
 
-    queues.delete(message.guild.id);
     return message.reply("⏹ Stopped the music and left the voice channel.");
   }
 
