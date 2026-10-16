@@ -138,7 +138,6 @@ async function handleCommand(message, queues, play) {
 
         try {
           if (playerObj.queue.length === 0) {
-            console.log(`[${message.guild.id}] Idle event fired with an empty queue.`);
             if (playerObj.idleTimer) return;
             await playNext(message.guild.id, message, queues);
             return;

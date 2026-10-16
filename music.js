@@ -1,7 +1,9 @@
 const { createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require("@discordjs/voice");
 const { spawn, spawnSync } = require("node:child_process");
+const { Transform } = require("node:stream");
 const ffmpeg = require("ffmpeg-static");
 const play = require("play-dl");
+const { download: downloadYtDlp } = require("@distube/yt-dlp");
 const path = require("path");
 const fs = require("fs");
 
@@ -10,6 +12,18 @@ function getIdleTimeoutMs() {
     return Number.isFinite(configuredTimeout) && configuredTimeout > 0
         ? configuredTimeout
         : 5 * 60 * 1000;
+}
+
+function monitorAudioStream(stream) {
+    const monitor = new Transform({
+        transform(chunk, encoding, callback) {
+            callback(null, chunk);
+        }
+    });
+
+    stream.on('error', (error) => monitor.destroy(error));
+
+    return stream.pipe(monitor);
 }
 
 function clearIdleDisconnect(playerObj) {
@@ -40,9 +54,22 @@ function scheduleIdleDisconnect(guildId, message, queues, playerObj) {
     }, timeoutMs);
 }
 
+function buildYtDlpArgs(url) {
+    return [
+        '-f', 'bestaudio/best',
+        '--no-playlist',
+        '--quiet',
+        '--no-warnings',
+        '--js-runtimes', 'node',
+        '--extractor-args', 'youtube:player_client=android,web',
+        '-o', '-',
+        url,
+    ];
+}
+
 function resolveYtDlpPath() {
     if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
-        return { command: process.env.YT_DLP_PATH, args: ['-f', 'bestaudio', '--no-playlist', '--quiet', '-o', '-', 'URL'] };
+        return { command: process.env.YT_DLP_PATH, args: buildYtDlpArgs('URL') };
     }
 
     const candidates = [
@@ -53,12 +80,13 @@ function resolveYtDlpPath() {
         path.join(process.env.APPDATA || '', 'Python', 'Python310', 'Scripts', 'yt-dlp.exe'),
         path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python314', 'Scripts', 'yt-dlp.exe'),
         path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python313', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python312', 'Scripts', 'yt-dlp.exe')
+        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python312', 'Scripts', 'yt-dlp.exe'),
+        path.join(__dirname, 'node_modules', '@distube', 'yt-dlp', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
     ];
 
     const actualPath = candidates.find((candidate) => candidate && fs.existsSync(candidate));
     if (actualPath) {
-        return { command: actualPath, args: ['-f', 'bestaudio', '--no-playlist', '--quiet', '-o', '-', 'URL'] };
+        return { command: actualPath, args: buildYtDlpArgs('URL') };
     }
 
     const pythonFallbacks = process.platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python'];
@@ -66,7 +94,7 @@ function resolveYtDlpPath() {
         try {
             const probe = spawnSync(python, ['-m', 'yt_dlp', '--version'], { stdio: 'ignore' });
             if (probe.status === 0) {
-                return { command: python, args: ['-m', 'yt_dlp', '-f', 'bestaudio', '--no-playlist', '--quiet', '-o', '-', 'URL'] };
+                return { command: python, args: ['-m', 'yt_dlp', ...buildYtDlpArgs('URL')] };
             }
         } catch (err) {
             // Ignore and keep trying.
@@ -76,62 +104,116 @@ function resolveYtDlpPath() {
     return null;
 }
 
-function createYoutubeAudioStream(url) {
-    return new Promise((resolve, reject) => {
-        const ytDlpConfig = resolveYtDlpPath();
-        if (!ytDlpConfig) {
-            return reject(new Error('yt-dlp was not found. Install it with: py -m pip install yt-dlp'));
+async function ensureYtDlpAvailable() {
+    const packageBin = path.join(
+        process.env.YTDLP_DIR || path.join(__dirname, 'node_modules', '@distube', 'yt-dlp', 'bin'),
+        process.env.YTDLP_FILENAME || `yt-dlp${process.platform === 'win32' ? '.exe' : ''}`
+    );
+    let ytDlpConfig = resolveYtDlpPath();
+    if (!ytDlpConfig) {
+        await downloadYtDlp();
+        ytDlpConfig = { command: packageBin, args: buildYtDlpArgs('URL') };
+    }
+
+    if (path.resolve(ytDlpConfig.command) === path.resolve(packageBin)) {
+        let previousSize = -1;
+        let stableChecks = 0;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+            try {
+                const { size } = await fs.promises.stat(packageBin);
+                if (size > 0 && size === previousSize) {
+                    stableChecks += 1;
+                    if (stableChecks >= 10) return ytDlpConfig;
+                } else {
+                    stableChecks = 0;
+                }
+                previousSize = size;
+            } catch (err) {
+                previousSize = -1;
+                stableChecks = 0;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
         }
 
-        const ytDlp = spawn(ytDlpConfig.command, ytDlpConfig.args.map((arg) => (arg === 'URL' ? url : arg)), {
-            stdio: ['ignore', 'pipe', 'pipe'],
-            shell: false
-        });
+        throw new Error(`yt-dlp binary did not finish downloading: ${packageBin}`);
+    }
 
-        let ytDlpError = '';
-        ytDlp.stderr.on('data', (chunk) => {
-            ytDlpError += chunk.toString();
-        });
+    return ytDlpConfig;
+}
 
-        ytDlp.on('error', (err) => reject(new Error(`Failed to start yt-dlp: ${err.message}`)));
-
-        const ffmpegProcess = spawn(ffmpeg, ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'], {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            shell: false
-        });
-
-        let ffmpegError = '';
-        ffmpegProcess.stderr.on('data', (chunk) => {
-            ffmpegError += chunk.toString();
-        });
-
-        ffmpegProcess.stdin.on('error', (err) => {
-            if (err.code !== 'EPIPE') {
-                console.error(`ffmpeg input stream error: ${err.message}`);
+function createYoutubeAudioStream(url) {
+    return play.stream(url, {
+        discordPlayerCompatibility: true
+    })
+        .then((info) => ({
+            stream: monitorAudioStream(info.stream),
+            type: info.type,
+        }))
+        .catch(async (playDlError) => {
+            const ytDlpConfig = await ensureYtDlpAvailable().catch((downloadError) => {
+                throw new Error(`play-dl failed: ${playDlError.message}; yt-dlp download failed: ${downloadError.message}`);
+            });
+            if (!ytDlpConfig) {
+                throw new Error(`play-dl failed: ${playDlError.message}; yt-dlp was not found after attempting to download it.`);
             }
+
+            return new Promise((resolve, reject) => {
+                const ytDlp = spawn(ytDlpConfig.command, ytDlpConfig.args.map((arg) => (arg === 'URL' ? url : arg)), {
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    shell: false
+                });
+
+                let ytDlpError = '';
+                ytDlp.stderr.on('data', (chunk) => {
+                    ytDlpError += chunk.toString();
+                });
+
+                ytDlp.on('error', (err) => {
+                    console.error(`[audio] yt-dlp spawn error: ${err.message}`);
+                    reject(new Error(`Failed to start yt-dlp: ${err.message}`));
+                });
+
+                const ffmpegProcess = spawn(ffmpeg, ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'], {
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                    shell: false
+                });
+
+                let ffmpegError = '';
+                ffmpegProcess.stderr.on('data', (chunk) => {
+                    ffmpegError += chunk.toString();
+                });
+
+                ffmpegProcess.stdin.on('error', (err) => {
+                    if (err.code !== 'EPIPE') {
+                        console.error(`ffmpeg input stream error: ${err.message}`);
+                    }
+                });
+
+                ffmpegProcess.on('error', (err) => {
+                    console.error(`[audio] ffmpeg spawn error: ${err.message}`);
+                    reject(new Error(`Failed to start ffmpeg: ${err.message}`));
+                });
+
+                ytDlp.stdout.pipe(ffmpegProcess.stdin);
+
+                ytDlp.on('close', (code) => {
+                    if (code !== 0) {
+                        reject(new Error(`yt-dlp failed while resolving YouTube audio: ${ytDlpError || 'unknown yt-dlp error'}`));
+                    }
+                });
+
+                ffmpegProcess.on('close', (code) => {
+                    if (ytDlp.exitCode === null && !ytDlp.killed) {
+                        ytDlp.kill();
+                    }
+                    if (code !== 0 && !ffmpegError.includes('Output file')) {
+                        reject(new Error(`ffmpeg failed while converting YouTube audio: ${ffmpegError || 'unknown ffmpeg error'}`));
+                    }
+                });
+
+                resolve({ stream: monitorAudioStream(ffmpegProcess.stdout), type: 'raw' });
+            });
         });
-
-        ffmpegProcess.on('error', (err) => reject(new Error(`Failed to start ffmpeg: ${err.message}`)));
-
-        ytDlp.stdout.pipe(ffmpegProcess.stdin);
-
-        ytDlp.on('close', (code) => {
-            if (code !== 0) {
-                reject(new Error(`yt-dlp failed while resolving YouTube audio: ${ytDlpError || 'unknown yt-dlp error'}`));
-            }
-        });
-
-        ffmpegProcess.on('close', (code) => {
-            if (ytDlp.exitCode === null && !ytDlp.killed) {
-                ytDlp.kill();
-            }
-            if (code !== 0 && !ffmpegError.includes('Output file')) {
-                reject(new Error(`ffmpeg failed while converting YouTube audio: ${ffmpegError || 'unknown ffmpeg error'}`));
-            }
-        });
-
-        resolve(ffmpegProcess.stdout);
-    });
 }
 
 async function playNext(guildId, message, queues) {
@@ -139,7 +221,6 @@ async function playNext(guildId, message, queues) {
     if (!playerObj) return;
 
     if (playerObj.queue.length === 0) {
-        console.log(`[${guildId}] Queue finished. Scheduling idle disconnect.`);
         scheduleIdleDisconnect(guildId, message, queues, playerObj);
         if (playerObj.player.state.status !== AudioPlayerStatus.Idle) {
             playerObj.player.stop();
@@ -170,8 +251,8 @@ async function playNext(guildId, message, queues) {
 
         } else if (nextItem.type === 'youtube') {
             const youtubeStream = await createYoutubeAudioStream(nextItem.source);
-            resource = createAudioResource(youtubeStream, {
-                inputType: 'raw',
+            resource = createAudioResource(youtubeStream.stream, {
+                inputType: youtubeStream.type || 'raw',
                 inlineVolume: true
             });
 
