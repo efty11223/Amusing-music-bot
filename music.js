@@ -1,4 +1,8 @@
-const { createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require("@discordjs/voice");
+const {
+  createAudioResource,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+} = require("@discordjs/voice");
 const { spawn, spawnSync } = require("node:child_process");
 const { Transform } = require("node:stream");
 const ffmpeg = require("ffmpeg-static");
@@ -8,282 +12,569 @@ const path = require("path");
 const fs = require("fs");
 
 function getIdleTimeoutMs() {
-    const configuredTimeout = Number.parseInt(process.env.MUSIC_IDLE_TIMEOUT_MS, 10);
-    return Number.isFinite(configuredTimeout) && configuredTimeout > 0
-        ? configuredTimeout
-        : 5 * 60 * 1000;
+  const configuredTimeout = Number.parseInt(
+    process.env.MUSIC_IDLE_TIMEOUT_MS,
+    10,
+  );
+  return Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : 5 * 60 * 1000;
 }
 
 function monitorAudioStream(stream) {
-    const monitor = new Transform({
-        transform(chunk, encoding, callback) {
-            callback(null, chunk);
-        }
-    });
+  const monitor = new Transform({
+    transform(chunk, encoding, callback) {
+      callback(null, chunk);
+    },
+  });
 
-    stream.on('error', (error) => monitor.destroy(error));
+  stream.on("error", (error) => monitor.destroy(error));
 
-    return stream.pipe(monitor);
+  return stream.pipe(monitor);
+}
+
+function getYoutubeVideoId(url) {
+  try {
+    const parsedUrl = new URL(url);
+    const hostname = parsedUrl.hostname.toLowerCase().replace(/^www\./, "");
+    let videoId;
+
+    if (hostname === "youtu.be") {
+      videoId = parsedUrl.pathname.split("/").filter(Boolean)[0];
+    } else if (
+      hostname === "youtube.com" ||
+      hostname.endsWith(".youtube.com") ||
+      hostname === "youtube-nocookie.com" ||
+      hostname.endsWith(".youtube-nocookie.com")
+    ) {
+      videoId = parsedUrl.searchParams.get("v");
+      if (!videoId) {
+        videoId = parsedUrl.pathname.split("/").filter(Boolean)[1];
+      }
+    }
+
+    return videoId && /^[\w-]{11}$/.test(videoId) ? videoId : null;
+  } catch (error) {
+    return null;
+  }
 }
 
 function clearIdleDisconnect(playerObj) {
-    if (playerObj && playerObj.idleTimer) {
-        clearTimeout(playerObj.idleTimer);
-        playerObj.idleTimer = null;
-    }
+  if (playerObj && playerObj.idleTimer) {
+    clearTimeout(playerObj.idleTimer);
+    playerObj.idleTimer = null;
+  }
 }
 
 function scheduleIdleDisconnect(guildId, message, queues, playerObj) {
-    clearIdleDisconnect(playerObj);
-    const timeoutMs = getIdleTimeoutMs();
+  clearIdleDisconnect(playerObj);
+  const timeoutMs = getIdleTimeoutMs();
 
-    playerObj.idleTimer = setTimeout(() => {
-        if (queues.get(guildId) !== playerObj) return;
+  playerObj.idleTimer = setTimeout(() => {
+    if (queues.get(guildId) !== playerObj) return;
 
-        playerObj.idleTimer = null;
-        if (playerObj.queue.length > 0 || playerObj.player.state.status !== AudioPlayerStatus.Idle) return;
+    playerObj.idleTimer = null;
+    if (
+      playerObj.queue.length > 0 ||
+      playerObj.player.state.status !== AudioPlayerStatus.Idle
+    )
+      return;
 
-        queues.delete(guildId);
-        if (playerObj.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-            playerObj.connection.destroy();
-        }
+    queues.delete(guildId);
+    if (playerObj.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      playerObj.connection.destroy();
+    }
 
-        if (message && message.channel) {
-            message.channel.send(`👋 Disconnected after ${Math.ceil(timeoutMs / 60000)} minutes of inactivity.`);
-        }
-    }, timeoutMs);
+    if (message && message.channel) {
+      message.channel.send(
+        `👋 Disconnected after ${Math.ceil(timeoutMs / 60000)} minutes of inactivity.`,
+      );
+    }
+  }, timeoutMs);
 }
 
-function buildYtDlpArgs(url) {
-    return [
-        '-f', 'bestaudio/best',
-        '--no-playlist',
-        '--quiet',
-        '--no-warnings',
-        '--js-runtimes', 'node',
-        '--extractor-args', 'youtube:player_client=android,web',
-        '-o', '-',
-        url,
-    ];
+function formatYtDlpTimestamp(totalSeconds) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function buildYtDlpArgs(url, seekSeconds = null) {
+  const args = [
+    "-f",
+    "bestaudio/best",
+    "--no-playlist",
+    "--quiet",
+    "--no-warnings",
+    "--js-runtimes",
+    "node",
+    "--extractor-args",
+    "youtube:player_client=android,web",
+  ];
+
+  if (seekSeconds !== null) {
+    args.push(
+      "--download-sections",
+      `*${formatYtDlpTimestamp(seekSeconds)}-inf`,
+    );
+  }
+
+  args.push("-o", "-", url);
+  return args;
 }
 
 function resolveYtDlpPath() {
-    if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
-        return { command: process.env.YT_DLP_PATH, args: buildYtDlpArgs('URL') };
+  if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
+    return { command: process.env.YT_DLP_PATH, args: buildYtDlpArgs("URL") };
+  }
+
+  const candidates = [
+    path.join(
+      process.env.APPDATA || "",
+      "Python",
+      "Python314",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.APPDATA || "",
+      "Python",
+      "Python313",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.APPDATA || "",
+      "Python",
+      "Python312",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.APPDATA || "",
+      "Python",
+      "Python311",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.APPDATA || "",
+      "Python",
+      "Python310",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.LOCALAPPDATA || "",
+      "Programs",
+      "Python",
+      "Python314",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.LOCALAPPDATA || "",
+      "Programs",
+      "Python",
+      "Python313",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      process.env.LOCALAPPDATA || "",
+      "Programs",
+      "Python",
+      "Python312",
+      "Scripts",
+      "yt-dlp.exe",
+    ),
+    path.join(
+      __dirname,
+      "node_modules",
+      "@distube",
+      "yt-dlp",
+      "bin",
+      process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp",
+    ),
+  ];
+
+  const actualPath = candidates.find(
+    (candidate) => candidate && fs.existsSync(candidate),
+  );
+  if (actualPath) {
+    return { command: actualPath, args: buildYtDlpArgs("URL") };
+  }
+
+  const pythonFallbacks =
+    process.platform === "win32"
+      ? ["py", "python", "python3"]
+      : ["python3", "python"];
+  for (const python of pythonFallbacks) {
+    try {
+      const probe = spawnSync(python, ["-m", "yt_dlp", "--version"], {
+        stdio: "ignore",
+      });
+      if (probe.status === 0) {
+        return {
+          command: python,
+          args: ["-m", "yt_dlp", ...buildYtDlpArgs("URL")],
+        };
+      }
+    } catch (err) {
+      // Ignore and keep trying.
     }
+  }
 
-    const candidates = [
-        path.join(process.env.APPDATA || '', 'Python', 'Python314', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.APPDATA || '', 'Python', 'Python313', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.APPDATA || '', 'Python', 'Python312', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.APPDATA || '', 'Python', 'Python311', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.APPDATA || '', 'Python', 'Python310', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python314', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python313', 'Scripts', 'yt-dlp.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python312', 'Scripts', 'yt-dlp.exe'),
-        path.join(__dirname, 'node_modules', '@distube', 'yt-dlp', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
-    ];
-
-    const actualPath = candidates.find((candidate) => candidate && fs.existsSync(candidate));
-    if (actualPath) {
-        return { command: actualPath, args: buildYtDlpArgs('URL') };
-    }
-
-    const pythonFallbacks = process.platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python'];
-    for (const python of pythonFallbacks) {
-        try {
-            const probe = spawnSync(python, ['-m', 'yt_dlp', '--version'], { stdio: 'ignore' });
-            if (probe.status === 0) {
-                return { command: python, args: ['-m', 'yt_dlp', ...buildYtDlpArgs('URL')] };
-            }
-        } catch (err) {
-            // Ignore and keep trying.
-        }
-    }
-
-    return null;
+  return null;
 }
 
 async function ensureYtDlpAvailable() {
-    const packageBin = path.join(
-        process.env.YTDLP_DIR || path.join(__dirname, 'node_modules', '@distube', 'yt-dlp', 'bin'),
-        process.env.YTDLP_FILENAME || `yt-dlp${process.platform === 'win32' ? '.exe' : ''}`
-    );
-    let ytDlpConfig = resolveYtDlpPath();
-    if (!ytDlpConfig) {
-        await downloadYtDlp();
-        ytDlpConfig = { command: packageBin, args: buildYtDlpArgs('URL') };
-    }
+  const packageBin = path.join(
+    process.env.YTDLP_DIR ||
+      path.join(__dirname, "node_modules", "@distube", "yt-dlp", "bin"),
+    process.env.YTDLP_FILENAME ||
+      `yt-dlp${process.platform === "win32" ? ".exe" : ""}`,
+  );
+  let ytDlpConfig = resolveYtDlpPath();
+  if (!ytDlpConfig) {
+    await downloadYtDlp();
+    ytDlpConfig = { command: packageBin, args: buildYtDlpArgs("URL") };
+  }
 
-    if (path.resolve(ytDlpConfig.command) === path.resolve(packageBin)) {
-        let previousSize = -1;
-        let stableChecks = 0;
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-            try {
-                const { size } = await fs.promises.stat(packageBin);
-                if (size > 0 && size === previousSize) {
-                    stableChecks += 1;
-                    if (stableChecks >= 10) return ytDlpConfig;
-                } else {
-                    stableChecks = 0;
-                }
-                previousSize = size;
-            } catch (err) {
-                previousSize = -1;
-                stableChecks = 0;
-            }
-            await new Promise((resolve) => setTimeout(resolve, 100));
+  if (path.resolve(ytDlpConfig.command) === path.resolve(packageBin)) {
+    let previousSize = -1;
+    let stableChecks = 0;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        const { size } = await fs.promises.stat(packageBin);
+        if (size > 0 && size === previousSize) {
+          stableChecks += 1;
+          if (stableChecks >= 10) return ytDlpConfig;
+        } else {
+          stableChecks = 0;
         }
-
-        throw new Error(`yt-dlp binary did not finish downloading: ${packageBin}`);
+        previousSize = size;
+      } catch (err) {
+        previousSize = -1;
+        stableChecks = 0;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
-    return ytDlpConfig;
+    throw new Error(`yt-dlp binary did not finish downloading: ${packageBin}`);
+  }
+
+  return ytDlpConfig;
 }
 
-function createYoutubeAudioStream(url) {
-    return play.stream(url, {
-        discordPlayerCompatibility: true
+async function createYtDlpAudioStream(url, seekSeconds = null, onStreamFailure = null) {
+  const ytDlpConfig = await ensureYtDlpAvailable();
+  const formatArgsIndex = ytDlpConfig.args.indexOf("-f");
+  const prefixArgs =
+    formatArgsIndex === -1 ? [] : ytDlpConfig.args.slice(0, formatArgsIndex);
+  const ytDlpArgs = [...prefixArgs, ...buildYtDlpArgs("URL", seekSeconds)].map(
+    (arg) => (arg === "URL" ? url : arg),
+  );
+  const ytDlp = spawn(ytDlpConfig.command, ytDlpArgs, {
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  });
+
+  let ytDlpError = "";
+  ytDlp.stderr.on("data", (chunk) => {
+    ytDlpError += chunk.toString();
+  });
+
+  const ffmpegProcess = spawn(
+    ffmpeg,
+    ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"],
+    {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+    },
+  );
+
+  let ffmpegError = "";
+  ffmpegProcess.stderr.on("data", (chunk) => {
+    ffmpegError += chunk.toString();
+  });
+
+  const output = monitorAudioStream(ffmpegProcess.stdout);
+
+  ytDlp.on("error", (err) => {
+    console.error(`[audio] yt-dlp spawn error: ${err.message}`);
+    ffmpegProcess.stdin.destroy();
+    output.destroy(new Error(`Failed to start yt-dlp: ${err.message}`));
+  });
+
+  ffmpegProcess.stdin.on("error", (err) => {
+    if (err.code !== "EPIPE") {
+      console.error(`ffmpeg input stream error: ${err.message}`);
+    }
+  });
+
+  ffmpegProcess.on("error", (err) => {
+    console.error(`[audio] ffmpeg spawn error: ${err.message}`);
+    if (ytDlp.exitCode === null && !ytDlp.killed) {
+      ytDlp.kill();
+    }
+    output.destroy(new Error(`Failed to start ffmpeg: ${err.message}`));
+  });
+
+  output.on("close", () => {
+    if (ytDlp.exitCode === null && !ytDlp.killed) {
+      ytDlp.kill();
+    }
+    if (ffmpegProcess.exitCode === null && !ffmpegProcess.killed) {
+      ffmpegProcess.kill();
+    }
+  });
+
+  ytDlp.stdout.pipe(ffmpegProcess.stdin);
+
+  ytDlp.on("close", (code) => {
+    if (code !== 0) {
+      if (typeof onStreamFailure === "function") {
+        onStreamFailure(
+          `yt-dlp failed while resolving audio: ${ytDlpError || "unknown yt-dlp error"}`,
+        );
+      }
+      ffmpegProcess.stdin.destroy();
+      output.destroy(
+        new Error(
+          `yt-dlp failed while resolving audio: ${ytDlpError || "unknown yt-dlp error"}`,
+        ),
+      );
+    }
+  });
+
+  ffmpegProcess.on("close", (code) => {
+    if (ytDlp.exitCode === null && !ytDlp.killed) {
+      ytDlp.kill();
+    }
+    const ffmpegReportedCorruption =
+      /partial file|corrupt (?:input )?packet|invalid data found/i.test(
+        ffmpegError,
+      );
+    if (typeof onStreamFailure === "function" && ffmpegReportedCorruption) {
+      onStreamFailure(
+        `ffmpeg reported an incomplete or corrupt stream: ${ffmpegError.trim().slice(-500)}`,
+      );
+    }
+    if (code !== 0 && !ffmpegError.includes("Output file")) {
+      if (typeof onStreamFailure === "function") {
+        onStreamFailure(
+          `ffmpeg failed while converting audio: ${ffmpegError || "unknown ffmpeg error"}`,
+        );
+      }
+      output.destroy(
+        new Error(
+          `ffmpeg failed while converting audio: ${ffmpegError || "unknown ffmpeg error"}`,
+        ),
+      );
+    }
+  });
+
+  return { stream: output, type: "raw" };
+}
+
+function createLocalAudioStream(filePath, seekSeconds) {
+  const ffmpegProcess = spawn(
+    ffmpeg,
+    [
+      "-ss",
+      String(seekSeconds),
+      "-i",
+      filePath,
+      "-f",
+      "s16le",
+      "-ar",
+      "48000",
+      "-ac",
+      "2",
+      "pipe:1",
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+    },
+  );
+
+  let ffmpegError = "";
+  ffmpegProcess.stderr.on("data", (chunk) => {
+    ffmpegError += chunk.toString();
+  });
+
+  const output = monitorAudioStream(ffmpegProcess.stdout);
+  ffmpegProcess.on("error", (err) => {
+    console.error(`[audio] ffmpeg spawn error: ${err.message}`);
+    output.destroy(new Error(`Failed to start ffmpeg: ${err.message}`));
+  });
+  output.on("close", () => {
+    if (ffmpegProcess.exitCode === null && !ffmpegProcess.killed) {
+      ffmpegProcess.kill();
+    }
+  });
+  ffmpegProcess.on("close", (code) => {
+    if (code !== 0 && !ffmpegError.includes("Output file")) {
+      output.destroy(
+        new Error(
+          `ffmpeg failed while seeking in local audio: ${ffmpegError || "unknown ffmpeg error"}`,
+        ),
+      );
+    }
+  });
+
+  return { stream: output, type: "raw" };
+}
+
+async function createSeekAudioStream(item, seekSeconds) {
+  if (!Number.isSafeInteger(seekSeconds) || seekSeconds < 0) {
+    throw new Error(
+      "Seek position must be a non-negative whole number of seconds.",
+    );
+  }
+
+  if (item.type === "local") {
+    const filePath = path.resolve(__dirname, item.source);
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Local audio file not found: ${filePath}`);
+    }
+    return createLocalAudioStream(filePath, seekSeconds);
+  }
+
+  if (item.type === "youtube" || item.type === "soundcloud") {
+    return createYtDlpAudioStream(item.source, seekSeconds);
+  }
+
+  throw new Error(`Seeking is not supported for source type: ${item.type}`);
+}
+
+function createYoutubeAudioStream(url, onStreamFailure = null) {
+  return play
+    .stream(url, {
+      discordPlayerCompatibility: true,
     })
-        .then((info) => ({
-            stream: monitorAudioStream(info.stream),
-            type: info.type,
-        }))
-        .catch(async (playDlError) => {
-            const ytDlpConfig = await ensureYtDlpAvailable().catch((downloadError) => {
-                throw new Error(`play-dl failed: ${playDlError.message}; yt-dlp download failed: ${downloadError.message}`);
-            });
-            if (!ytDlpConfig) {
-                throw new Error(`play-dl failed: ${playDlError.message}; yt-dlp was not found after attempting to download it.`);
-            }
-
-            return new Promise((resolve, reject) => {
-                const ytDlp = spawn(ytDlpConfig.command, ytDlpConfig.args.map((arg) => (arg === 'URL' ? url : arg)), {
-                    stdio: ['ignore', 'pipe', 'pipe'],
-                    shell: false
-                });
-
-                let ytDlpError = '';
-                ytDlp.stderr.on('data', (chunk) => {
-                    ytDlpError += chunk.toString();
-                });
-
-                ytDlp.on('error', (err) => {
-                    console.error(`[audio] yt-dlp spawn error: ${err.message}`);
-                    reject(new Error(`Failed to start yt-dlp: ${err.message}`));
-                });
-
-                const ffmpegProcess = spawn(ffmpeg, ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'], {
-                    stdio: ['pipe', 'pipe', 'pipe'],
-                    shell: false
-                });
-
-                let ffmpegError = '';
-                ffmpegProcess.stderr.on('data', (chunk) => {
-                    ffmpegError += chunk.toString();
-                });
-
-                ffmpegProcess.stdin.on('error', (err) => {
-                    if (err.code !== 'EPIPE') {
-                        console.error(`ffmpeg input stream error: ${err.message}`);
-                    }
-                });
-
-                ffmpegProcess.on('error', (err) => {
-                    console.error(`[audio] ffmpeg spawn error: ${err.message}`);
-                    reject(new Error(`Failed to start ffmpeg: ${err.message}`));
-                });
-
-                ytDlp.stdout.pipe(ffmpegProcess.stdin);
-
-                ytDlp.on('close', (code) => {
-                    if (code !== 0) {
-                        reject(new Error(`yt-dlp failed while resolving YouTube audio: ${ytDlpError || 'unknown yt-dlp error'}`));
-                    }
-                });
-
-                ffmpegProcess.on('close', (code) => {
-                    if (ytDlp.exitCode === null && !ytDlp.killed) {
-                        ytDlp.kill();
-                    }
-                    if (code !== 0 && !ffmpegError.includes('Output file')) {
-                        reject(new Error(`ffmpeg failed while converting YouTube audio: ${ffmpegError || 'unknown ffmpeg error'}`));
-                    }
-                });
-
-                resolve({ stream: monitorAudioStream(ffmpegProcess.stdout), type: 'raw' });
-            });
+    .then((info) => {
+      const stream = monitorAudioStream(info.stream);
+      if (typeof onStreamFailure === "function") {
+        stream.on("error", (error) => {
+          onStreamFailure(error.message || String(error));
         });
+      }
+      return { stream, type: info.type };
+    })
+    .catch(async (playDlError) => {
+      return createYtDlpAudioStream(url, null, onStreamFailure).catch((downloadError) => {
+        throw new Error(
+          `play-dl failed: ${playDlError.message}; yt-dlp download failed: ${downloadError.message}`,
+        );
+      });
+    });
 }
 
 async function playNext(guildId, message, queues) {
-    const playerObj = queues.get(guildId);
-    if (!playerObj) return;
+  const playerObj = queues.get(guildId);
+  if (!playerObj) return;
 
-    if (playerObj.queue.length === 0) {
-        scheduleIdleDisconnect(guildId, message, queues, playerObj);
-        if (playerObj.player.state.status !== AudioPlayerStatus.Idle) {
-            playerObj.player.stop();
-        }
-        if (message && message.channel) {
-            const timeoutMinutes = Math.ceil(getIdleTimeoutMs() / 60000);
-            message.channel.send(`✅ Queue finished. I'll disconnect after ${timeoutMinutes} minutes of inactivity.`);
-        }
-        return;
+  if (playerObj.queue.length === 0) {
+    scheduleIdleDisconnect(guildId, message, queues, playerObj);
+    if (playerObj.player.state.status !== AudioPlayerStatus.Idle) {
+      playerObj.player.stop();
+    }
+    if (message && message.channel) {
+      const timeoutMinutes = Math.ceil(getIdleTimeoutMs() / 60000);
+      message.channel.send(
+        `✅ Queue finished. I'll disconnect after ${timeoutMinutes} minutes of inactivity.`,
+      );
+    }
+    return;
+  }
+
+  clearIdleDisconnect(playerObj);
+  const nextItem = playerObj.queue[0];
+  playerObj.currentItem = nextItem;
+  let resource;
+
+  if (!nextItem || !nextItem.source) {
+    console.error(`[${guildId}] Invalid song object retrieved. Skipping.`);
+    if (message && message.channel) {
+      message.channel.send(
+        "❌ Error: Malformed song data encountered, skipping...",
+      );
+    }
+    return playNext(guildId, message, queues);
+  }
+
+  try {
+    if (nextItem.type === "local") {
+      const filePath = path.resolve(__dirname, nextItem.source);
+      resource = createAudioResource(filePath);
+    } else     if (nextItem.type === "youtube") {
+    const youtubeStream = await createYoutubeAudioStream(
+      nextItem.source,
+      (error) => {
+        playerObj.streamFailure = {
+          source: nextItem.source,
+          error,
+        };
+      },
+    );
+      resource = createAudioResource(youtubeStream.stream, {
+        inputType: youtubeStream.type || "raw",
+        inlineVolume: true,
+      });
+    } else if (nextItem.type === "soundcloud") {
+      const yt_info = await play.stream(nextItem.source, {
+        discordPlayerCompatibility: true,
+      });
+
+      resource = createAudioResource(yt_info.stream, {
+        inputType: yt_info.type,
+        inlineVolume: true,
+      });
     }
 
-    clearIdleDisconnect(playerObj);
-    const nextItem = playerObj.queue[0];
-    let resource;
-
-    if (!nextItem || !nextItem.source) {
-        console.error(`[${guildId}] Invalid song object retrieved. Skipping.`);
-        if (message && message.channel) {
-            message.channel.send("❌ Error: Malformed song data encountered, skipping...");
-        }
-        return playNext(guildId, message, queues);
+    playerObj.player.play(resource);
+    if (message && message.channel) {
+      const videoId =
+        nextItem.type === "youtube" ? getYoutubeVideoId(nextItem.source) : null;
+      if (videoId) {
+        message.channel.send({
+          embeds: [
+            {
+              color: 0xeea990,
+              description: `🎶 Now playing: **${nextItem.title}** (${nextItem.type})`,
+              url: nextItem.source,
+              thumbnail: {
+                url: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+              },
+            },
+          ],
+        });
+      } else {
+        message.channel.send(
+          `🎶 Now playing: **${nextItem.title}** (${nextItem.type})`,
+        );
+      }
     }
-
-    try {
-        if (nextItem.type === 'local') {
-            const filePath = path.resolve(__dirname, nextItem.source);
-            resource = createAudioResource(filePath);
-
-        } else if (nextItem.type === 'youtube') {
-            const youtubeStream = await createYoutubeAudioStream(nextItem.source);
-            resource = createAudioResource(youtubeStream.stream, {
-                inputType: youtubeStream.type || 'raw',
-                inlineVolume: true
-            });
-
-        } else if (nextItem.type === 'soundcloud') {
-            const yt_info = await play.stream(nextItem.source, {
-                discordPlayerCompatibility: true
-            });
-
-            resource = createAudioResource(yt_info.stream, {
-                inputType: yt_info.type,
-                inlineVolume: true
-            });
-        }
-
-        playerObj.player.play(resource);
-        if (message && message.channel) {
-            message.channel.send(`🎶 Now playing: **${nextItem.title}** (${nextItem.type})`);
-        }
-    } catch (err) {
-        console.error("Error playing item:", err);
-        playerObj.queue.shift();
-        if (message && message.channel) {
-            message.channel.send(`❌ Error playing **${nextItem.title}**, skipping...`);
-        }
-        playNext(guildId, message, queues);
+  } catch (err) {
+    console.error("Error playing item:", err);
+    playerObj.queue.shift();
+    if (message && message.channel) {
+      message.channel.send(
+        `❌ Error playing **${nextItem.title}**, skipping...`,
+      );
     }
+    playNext(guildId, message, queues);
+  }
 }
 
 module.exports = {
-    createYoutubeAudioStream,
-    clearIdleDisconnect,
-    playNext,
-    resolveYtDlpPath,
+  createYoutubeAudioStream,
+  createSeekAudioStream,
+  clearIdleDisconnect,
+  playNext,
+  resolveYtDlpPath,
 };

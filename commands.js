@@ -1,7 +1,39 @@
 const path = require("path");
 const fs = require("fs");
-const { joinVoiceChannel, createAudioPlayer, AudioPlayerStatus, VoiceConnectionStatus } = require("@discordjs/voice");
-const { clearIdleDisconnect, playNext } = require("./music");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require("@discordjs/voice");
+const { clearIdleDisconnect, createSeekAudioStream, playNext } = require("./music");
+
+function parseTimestamp(value) {
+  if (/^\d+$/.test(value)) {
+    const seconds = Number(value);
+    return Number.isSafeInteger(seconds) ? seconds : null;
+  }
+
+  const parts = value.split(":");
+  if (parts.length !== 2 && parts.length !== 3) return null;
+  if (!parts.every((part) => /^\d+$/.test(part))) return null;
+
+  const numbers = parts.map(Number);
+  if (!numbers.every(Number.isSafeInteger)) return null;
+
+  const seconds = numbers[numbers.length - 1];
+  const minutes = numbers.length === 2 ? numbers[0] : numbers[1];
+  if (seconds > 59 || (numbers.length === 3 && minutes > 59)) return null;
+
+  const totalSeconds = numbers.length === 2
+    ? numbers[0] * 60 + seconds
+    : numbers[0] * 3600 + minutes * 60 + seconds;
+  return Number.isSafeInteger(totalSeconds) ? totalSeconds : null;
+}
+
+function formatTimestamp(totalSeconds) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
 
 function leaveGuildVoice(message, queues) {
   const guildId = message.guild.id;
@@ -46,6 +78,7 @@ async function handleCommand(message, queues, play) {
           `\`${prefix}queue\` - Show the current queue`,
           `\`${prefix}pause\` - Pause playback`,
           `\`${prefix}resume\` - Resume playback`,
+          `\`${prefix}seek <timestamp>\` - Jump to a time (seconds, \`MM:SS\`, or \`HH:MM:SS\`)`,
           `\`${prefix}skip\` / \`${prefix}next\` - Skip the current track`,
           `\`${prefix}stop\` - Stop playback and leave voice`,
           `\`${prefix}leave\` - Leave voice`,
@@ -78,15 +111,9 @@ async function handleCommand(message, queues, play) {
         return message.reply("❌ Error accessing that SoundCloud track. It may be private or invalid.");
       }
     } else if (isYouTubeUrl || sourceValidation === "yt_video" || sourceValidation === "video") {
-      try {
-        const info = await play.video_basic_info(source);
-        itemType = "youtube";
-        itemSource = source;
-        itemTitle = info.video_details.title;
-      } catch (e) {
-        console.error("YouTube lookup failed:", e);
-        return message.reply("❌ Error accessing that YouTube video. It may be geo-blocked or invalid.");
-      }
+      itemType = "youtube";
+      itemSource = source;
+      itemTitle = source;
     } else {
       const filePath = path.resolve(__dirname, source);
       if (fs.existsSync(filePath)) {
@@ -115,6 +142,15 @@ async function handleCommand(message, queues, play) {
 
     const queueItem = { type: itemType, source: itemSource, title: itemTitle };
 
+    if (itemType === "youtube" && isYouTubeUrl) {
+      try {
+        await message.suppressEmbeds(true);
+      } catch (error) {
+        console.error("Could not suppress the YouTube link preview:", error);
+        await message.channel.send("⚠️ I couldn't hide the preview on your command message. Please give me the Manage Messages permission to hide it.");
+      }
+    }
+
     let playerObj = queues.get(message.guild.id);
     if (!playerObj) {
       const connection = joinVoiceChannel({
@@ -137,6 +173,40 @@ async function handleCommand(message, queues, play) {
         playerObj.isTransitioning = true;
 
         try {
+          if (
+            playerObj.streamFailure &&
+            playerObj.currentItem &&
+            playerObj.queue[0] &&
+            playerObj.queue[0].source === playerObj.currentItem.source &&
+            playerObj.streamFailure.source === playerObj.currentItem.source
+          ) {
+            const failedItem = playerObj.currentItem;
+            failedItem.retryCount = (failedItem.retryCount || 0) + 1;
+            const retryError = playerObj.streamFailure.error;
+            playerObj.streamFailure = null;
+
+            if (failedItem.retryCount <= 2) {
+              console.error(
+                `[${message.guild.id}] Stream interrupted; retrying ${failedItem.title} (${failedItem.retryCount}/2): ${retryError}`,
+              );
+              message.channel.send(
+                `⚠️ Stream interrupted. Retrying **${failedItem.title}**...`,
+              );
+              await playNext(message.guild.id, message, queues);
+              return;
+            }
+
+            console.error(
+              `[${message.guild.id}] Stream retry limit reached for ${failedItem.title}: ${retryError}`,
+            );
+            playerObj.queue.shift();
+            message.channel.send(
+              `❌ Could not recover **${failedItem.title}** after 2 retries. Skipping...`,
+            );
+            await playNext(message.guild.id, message, queues);
+            return;
+          }
+
           if (playerObj.queue.length === 0) {
             if (playerObj.idleTimer) return;
             await playNext(message.guild.id, message, queues);
@@ -207,6 +277,54 @@ async function handleCommand(message, queues, play) {
 
     playerObj.player.unpause();
     return message.reply("▶ Music resumed.");
+  }
+
+  if (command === "seek") {
+    const targetSeconds = parseTimestamp(source || "");
+    if (args.length !== 1 || targetSeconds === null) {
+      return message.reply(`❌ Provide a timestamp as seconds, \`MM:SS\`, or \`HH:MM:SS\` (for example, \`${prefix}seek 1:45\`).`);
+    }
+
+    const guildId = message.guild.id;
+    const playerObj = queues.get(guildId);
+    const currentItem = playerObj && playerObj.queue[0];
+    if (!playerObj || !playerObj.player || !currentItem ||
+        (playerObj.player.state.status !== AudioPlayerStatus.Playing &&
+         playerObj.player.state.status !== AudioPlayerStatus.Paused)) {
+      return message.reply("❌ Nothing is currently playing.");
+    }
+
+    if (playerObj.isTransitioning) {
+      return message.reply("❌ Please wait until the current track transition finishes.");
+    }
+
+    const seekRequest = (playerObj.seekRequest || 0) + 1;
+    playerObj.seekRequest = seekRequest;
+
+    try {
+      const audioStream = await createSeekAudioStream(currentItem, targetSeconds);
+      if (queues.get(guildId) !== playerObj ||
+          playerObj.queue[0] !== currentItem ||
+          playerObj.seekRequest !== seekRequest ||
+          (playerObj.player.state.status !== AudioPlayerStatus.Playing &&
+           playerObj.player.state.status !== AudioPlayerStatus.Paused)) {
+        audioStream.stream.destroy();
+        return message.reply("❌ The track changed before I could seek. Try again on the current track.");
+      }
+
+      const wasPaused = playerObj.player.state.status === AudioPlayerStatus.Paused;
+      const resource = createAudioResource(audioStream.stream, {
+        inputType: audioStream.type || "raw",
+        inlineVolume: true
+      });
+      playerObj.player.play(resource);
+      if (wasPaused) playerObj.player.pause();
+
+      return message.reply(`⏩ Jumped to ${formatTimestamp(targetSeconds)}.`);
+    } catch (error) {
+      console.error("Error seeking in track:", error);
+      return message.reply("❌ I couldn't seek in this track. Please try again or restart it.");
+    }
   }
 
   if (command === "skip" || command === "next") {
